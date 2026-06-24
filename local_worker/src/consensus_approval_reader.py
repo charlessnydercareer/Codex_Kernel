@@ -73,6 +73,72 @@ class ConsensusApprovalReader:
         except psycopg.Error:
             return None
 
+    def require_approval_by_proposal_hash(
+        self,
+        proposal_hash: str,
+    ) -> Dict[str, Any]:
+        """
+        Return the approval artifact bound to an exact canonical proposal hash.
+
+        The database column and JSON payload must agree. AlgebraGate performs
+        the full mutation, approval-hash, and quorum verification.
+        """
+        if not proposal_hash or not isinstance(proposal_hash, str):
+            raise ConsensusApprovalViolation(
+                "proposal_hash must be a non-empty string"
+            )
+
+        try:
+            with psycopg.connect(self.conn_str) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT a.approval_hash, a.payload
+                        FROM consensus_approvals AS a
+                        JOIN consensus_proposals AS p
+                          ON p.change_id = a.change_id
+                         AND p.proposal_hash = a.proposal_hash
+                        WHERE a.proposal_hash = %s
+                        ORDER BY a.id
+                        LIMIT 2
+                        """,
+                        (proposal_hash,),
+                    )
+                    rows = cur.fetchall()
+        except psycopg.Error as exc:
+            raise ConsensusApprovalViolation(
+                "Ledger query failed while reading proposal approval."
+            ) from exc
+
+        if not rows:
+            raise ConsensusApprovalViolation(
+                f"No consensus approval found for proposal_hash={proposal_hash}"
+            )
+        if len(rows) != 1:
+            raise ConsensusApprovalViolation(
+                "Multiple consensus approvals found for one proposal_hash."
+            )
+
+        approval_hash, payload = rows[0]
+        if not isinstance(payload, dict):
+            raise ConsensusApprovalViolation(
+                "Consensus approval payload is not an object."
+            )
+        if payload.get("proposal_hash") != proposal_hash:
+            raise ConsensusApprovalViolation(
+                "Consensus approval proposal_hash does not match its ledger row."
+            )
+        if payload.get("approval_hash") != approval_hash:
+            raise ConsensusApprovalViolation(
+                "Consensus approval hash does not match its ledger row."
+            )
+        if not approval_hash or not APPROVAL_HASH_PATTERN.fullmatch(approval_hash):
+            raise ConsensusApprovalViolation(
+                "Consensus approval hash is malformed."
+            )
+
+        return payload
+
     def require_approval(self, change_id: str, proposal_hash: str) -> Dict[str, Any]:
         """
         Return the approval artifact if change_id is approved for proposal_hash.
@@ -97,7 +163,7 @@ class ConsensusApprovalReader:
                     row = cur.fetchone()
         except psycopg.Error as exc:
             raise ConsensusApprovalViolation(
-                f"Ledger query failed for change_id={change_id}: {exc}"
+                f"Ledger query failed for change_id={change_id}."
             ) from exc
 
         if row is None:
