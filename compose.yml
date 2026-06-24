@@ -1,0 +1,87 @@
+services:
+  codex-postgres:
+    image: codex-postgres:18-pgjsonschema
+    container_name: codex-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: nexus_admin
+      POSTGRES_PASSWORD: ${CODEX_POSTGRES_PASSWORD}
+      POSTGRES_DB: codex_nexus
+
+    ports:
+      - "55432:5432"
+
+    volumes:
+      - codex_postgres_data:/var/lib/postgresql
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus_admin -d codex_nexus"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  codex-db-migrate:
+    image: codex-postgres:18-pgjsonschema
+    container_name: codex-db-migrate
+    restart: "no"
+
+    depends_on:
+      codex-postgres:
+        condition: service_healthy
+
+    environment:
+      PGHOST: codex-postgres
+      PGPORT: 5432
+      PGUSER: nexus_admin
+      PGPASSWORD: ${CODEX_POSTGRES_PASSWORD}
+      PGDATABASE: codex_nexus
+
+    volumes:
+      - ./local_worker/migrations:/migrations:ro
+
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+
+        echo "[MIGRATE] Applying Codex Kernel migrations..."
+
+        psql -f /migrations/000_bootstrap_extensions.sql
+        psql -f /migrations/001_create_consensus_ledger.sql
+        psql -f /migrations/002_create_event_streams.sql
+        psql -f /migrations/003_indexes.sql
+
+        echo "[MIGRATE] Complete."
+
+  codex-ledger-verify:
+    image: python:3.12-slim
+    container_name: codex-ledger-verify
+    restart: "no"
+
+    depends_on:
+      codex-postgres:
+        condition: service_healthy
+      codex-db-migrate:
+        condition: service_completed_successfully
+
+    working_dir: /app
+
+    environment:
+      CODEX_DATABASE_URL: ${CODEX_DATABASE_URL}
+
+    volumes:
+      - ./local_worker:/app:ro
+
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+
+        python -m pip install --no-cache-dir psycopg[binary]
+        python src/memory.py
+
+volumes:
+  codex_postgres_data:
