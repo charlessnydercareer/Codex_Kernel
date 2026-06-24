@@ -31,13 +31,12 @@ class ConsensusApprovalViolation(RuntimeError):
 
 class ConsensusApprovalReader:
     """
-    Queries consensus_approvals and verifies the approval artifact.
+    Queries consensus_proposals and consensus_approvals.
 
-    Checks:
-    - Row exists for change_id
-    - payload.event_type == "CONSENSUS_APPROVAL"
-    - payload.proposal_hash matches the caller-supplied proposal_hash
-    - approval_hash column is present and matches sha256: pattern
+    Provides three read paths:
+    - verify_proposal_hash: confirms a proposal row exists with matching hash
+    - get_approval: returns the approval payload or None
+    - require_approval: combined validation (raises on any mismatch)
     """
 
     def __init__(self, conn_str: Optional[str] = None) -> None:
@@ -45,6 +44,34 @@ class ConsensusApprovalReader:
             "CODEX_DATABASE_URL",
             "dbname=codex_nexus user=nexus_admin host=localhost",
         )
+
+    def verify_proposal_hash(self, change_id: str, proposal_hash: str) -> bool:
+        """Confirm a proposal row exists with the given hash."""
+        try:
+            with psycopg.connect(self.conn_str) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT proposal_hash FROM consensus_proposals WHERE change_id = %s",
+                        (change_id,),
+                    )
+                    row = cur.fetchone()
+                    return row is not None and row[0] == proposal_hash
+        except psycopg.Error:
+            return False
+
+    def get_approval(self, change_id: str) -> Optional[Dict[str, Any]]:
+        """Return the approval payload or None."""
+        try:
+            with psycopg.connect(self.conn_str) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT payload FROM consensus_approvals WHERE change_id = %s",
+                        (change_id,),
+                    )
+                    row = cur.fetchone()
+                    return row[0] if row else None
+        except psycopg.Error:
+            return None
 
     def require_approval(self, change_id: str, proposal_hash: str) -> Dict[str, Any]:
         """
