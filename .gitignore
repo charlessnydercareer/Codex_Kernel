@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime consensus and gossip state (not source)
+local_worker/var/
+
+# Compiled Python cache
+local_worker/src/__pycache__/
