@@ -25,6 +25,7 @@ import hmac
 import json
 import os
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -203,40 +204,35 @@ class GossipTransport:
     def build_proposal(
         self,
         *,
-        change_id: str,
-        parameter: str,
-        value: Any,
-        proposal_hash: str,
+        mutation: Dict[str, Any],
     ) -> Dict[str, Any]:
+        """
+        Wrap a finalized canonical Git-derived mutation (as emitted by
+        proposal_producer.py, including its proposal_hash) as a
+        CONSENSUS_PROPOSAL envelope.
+        """
         return AuthenticatedEnvelope.build(
             node_id=self.node_id,
             secret=self.secret,
             message_type="CONSENSUS_PROPOSAL",
-            payload={
-                "change_id": change_id,
-                "parameter": parameter,
-                "value": value,
-                "proposal_hash": proposal_hash,
-            },
+            payload=dict(mutation),
         )
 
     def build_vote(
         self,
         *,
-        change_id: str,
+        proposal_hash: str,
         voter_id: str,
         vote: bool,
-        proposal_hash: str,
     ) -> Dict[str, Any]:
         return AuthenticatedEnvelope.build(
             node_id=self.node_id,
             secret=self.secret,
             message_type="CONSENSUS_VOTE",
             payload={
-                "change_id": change_id,
+                "proposal_hash": proposal_hash,
                 "voter_id": voter_id,
                 "vote": bool(vote),
-                "proposal_hash": proposal_hash,
             },
         )
 
@@ -428,13 +424,16 @@ def main() -> int:
     sub.add_parser("serve")
 
     prop = sub.add_parser("propose")
-    prop.add_argument("--change-id", required=True)
-    prop.add_argument("--parameter", required=True)
-    prop.add_argument("--value", required=True)
-    prop.add_argument("--proposal-hash", required=True)
+    prop.add_argument(
+        "--mutation-json",
+        required=True,
+        help=(
+            "Path to a finalized canonical mutation JSON file produced by "
+            "proposal_producer.py, or '-' for stdin."
+        ),
+    )
 
     vote = sub.add_parser("vote")
-    vote.add_argument("--change-id", required=True)
     vote.add_argument("--voter-id", required=True)
     vote.add_argument("--proposal-hash", required=True)
     vote.add_argument("--yes", action="store_true")
@@ -461,12 +460,15 @@ def main() -> int:
         return 0
 
     if args.cmd == "propose":
-        envelope = transport.build_proposal(
-            change_id=args.change_id,
-            parameter=args.parameter,
-            value=args.value,
-            proposal_hash=args.proposal_hash,
-        )
+        if args.mutation_json == "-":
+            mutation = json.load(sys.stdin)
+        else:
+            with open(args.mutation_json, "r", encoding="utf-8") as handle:
+                mutation = json.load(handle)
+        if not isinstance(mutation, dict):
+            raise SystemExit("Mutation JSON must be an object")
+
+        envelope = transport.build_proposal(mutation=mutation)
         transport.ledger.append(envelope)
         transport.broadcast(envelope)
         print(f"[GOSSIP] proposal broadcast id={envelope['message_id']}")
@@ -477,10 +479,9 @@ def main() -> int:
             raise SystemExit("Specify exactly one of --yes or --no")
 
         envelope = transport.build_vote(
-            change_id=args.change_id,
+            proposal_hash=args.proposal_hash,
             voter_id=args.voter_id,
             vote=args.yes,
-            proposal_hash=args.proposal_hash,
         )
         transport.ledger.append(envelope)
         transport.broadcast(envelope)

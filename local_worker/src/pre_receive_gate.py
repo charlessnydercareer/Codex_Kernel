@@ -183,18 +183,15 @@ class PreReceiveGate:
                 f"Ref deletion is not allowed: {update.refname}"
             )
 
-        newrev = self.repository.commit_oid(update.newrev)
-        if is_zero_oid(update.oldrev):
-            oldrev = self.repository.empty_tree()
-        else:
-            oldrev = self.repository.commit_oid(update.oldrev)
-            if (
-                not self.allow_non_fast_forward
-                and not self.repository.is_ancestor(oldrev, newrev)
-            ):
-                raise PreReceiveViolation(
-                    f"Non-fast-forward update is not allowed: {update.refname}"
-                )
+        oldrev, newrev = self._resolve_revs(update)
+        if (
+            not is_zero_oid(update.oldrev)
+            and not self.allow_non_fast_forward
+            and not self.repository.is_ancestor(oldrev, newrev)
+        ):
+            raise PreReceiveViolation(
+                f"Non-fast-forward update is not allowed: {update.refname}"
+            )
 
         changed_paths = self.repository.changed_paths(oldrev, newrev)
         diff_hash = sha256_bytes(self.repository.diff_bytes(oldrev, newrev))
@@ -208,6 +205,36 @@ class PreReceiveGate:
             diff_hash=diff_hash,
         ):
             self.approval_checker(mutation)
+
+    def _resolve_revs(self, update: RefUpdate) -> tuple[str, str]:
+        newrev = self.repository.commit_oid(update.newrev)
+        if is_zero_oid(update.oldrev):
+            oldrev = self.repository.empty_tree()
+        else:
+            oldrev = self.repository.commit_oid(update.oldrev)
+        return oldrev, newrev
+
+    def derive_protected_mutations(
+        self,
+        update: RefUpdate,
+    ) -> list[dict[str, Any]]:
+        """
+        Derive finalized canonical mutations from the exact Git objects named
+        by a ref update. This is the single derivation path shared by online
+        enforcement (check_update) and the offline proposal producer, so an
+        approval generated offline binds to the identical payload the gate
+        recomputes during the push.
+        """
+        oldrev, newrev = self._resolve_revs(update)
+        changed_paths = self.repository.changed_paths(oldrev, newrev)
+        diff_hash = sha256_bytes(self.repository.diff_bytes(oldrev, newrev))
+        return self._protected_mutations(
+            update=update,
+            oldrev=oldrev,
+            newrev=newrev,
+            changed_paths=changed_paths,
+            diff_hash=diff_hash,
+        )
 
     def _scan_changed_python(
         self,

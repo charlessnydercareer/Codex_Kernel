@@ -11,6 +11,12 @@ Authority chain:
     consensus_gate.py              -> proposal/vote validation + quorum math
     algebra_gate.py                -> enforcement boundary
 
+Proposals are canonical Git-derived mutations (see canonical_consensus.py),
+produced offline by proposal_producer.py. Everything is keyed by the
+canonical proposal_hash, which binds each ballot and approval to the exact
+incoming Git object identity. There is no translation from any legacy
+change_id/parameter/value proposal shape.
+
 This module does NOT mutate kernel state.
 It only emits approved consensus artifacts that AlgebraGate may consume.
 """
@@ -21,21 +27,33 @@ import argparse
 import json
 import os
 import sys
-import hashlib
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 
 try:
-    from consensus_gate import ConsensusGate, ConsensusViolation, Proposal
+    from consensus_gate import ConsensusGate, ConsensusViolation
+    from canonical_consensus import (
+        APPROVAL_EVENT_TYPE,
+        CanonicalConsensusViolation,
+        build_approval_hash,
+        build_proposal_hash,
+        proposal_material,
+    )
 except ImportError:
     # Allows running as `python src/consensus_transport_bridge.py`
     sys.path.append(str(Path(__file__).resolve().parent))
-    from consensus_gate import ConsensusGate, ConsensusViolation, Proposal
+    from consensus_gate import ConsensusGate, ConsensusViolation
+    from canonical_consensus import (
+        APPROVAL_EVENT_TYPE,
+        CanonicalConsensusViolation,
+        build_approval_hash,
+        build_proposal_hash,
+        proposal_material,
+    )
 
 
-APPROVAL_EVENT_TYPE = "CONSENSUS_APPROVAL"
 SUPPORTED_MESSAGE_TYPES = {
     "CONSENSUS_PROPOSAL",
     "CONSENSUS_VOTE",
@@ -50,27 +68,15 @@ def utc_ts() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def canonical_json(payload: Dict[str, Any]) -> bytes:
-    return json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-
-
-def stable_hash(payload: Dict[str, Any]) -> str:
-    return "sha256:" + hashlib.sha256(canonical_json(payload)).hexdigest()
-
-
 class ApprovedProposalStore:
     """
     Writes durable approval artifacts for AlgebraGate.
 
-    This is not the full Postgres semantic ledger yet.
-    It is a Git/file-backed bootstrap bridge.
+    This is not the full Postgres semantic ledger.
+    It is a file-backed bootstrap bridge, keyed by canonical proposal_hash.
 
     Output:
-        var/consensus/approved/<change_id>.json
+        var/consensus/approved/<proposal_hash>.json
         var/consensus/events.jsonl
     """
 
@@ -85,15 +91,15 @@ class ApprovedProposalStore:
         self.approved_dir.mkdir(parents=True, exist_ok=True)
         self.events_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def approval_path(self, change_id: str) -> Path:
-        safe = change_id.replace("/", "_").replace("..", "_")
+    def approval_path(self, proposal_hash: str) -> Path:
+        safe = proposal_hash.replace(":", "_").replace("/", "_").replace("..", "_")
         return self.approved_dir / f"{safe}.json"
 
-    def has_approval(self, change_id: str) -> bool:
-        return self.approval_path(change_id).exists()
+    def has_approval(self, proposal_hash: str) -> bool:
+        return self.approval_path(proposal_hash).exists()
 
-    def read_approval(self, change_id: str) -> Dict[str, Any]:
-        path = self.approval_path(change_id)
+    def read_approval(self, proposal_hash: str) -> Dict[str, Any]:
+        path = self.approval_path(proposal_hash)
 
         if not path.exists():
             raise FileNotFoundError(path)
@@ -107,7 +113,7 @@ class ApprovedProposalStore:
         return data
 
     def write_approval(self, event: Dict[str, Any]) -> None:
-        path = self.approval_path(event["change_id"])
+        path = self.approval_path(event["proposal_hash"])
 
         if path.exists():
             return
@@ -138,8 +144,7 @@ class ConsensusTransportBridge:
 
     This bridge verifies:
         - message type
-        - known proposal/vote semantics
-        - proposal hash binding
+        - canonical mutation payload and proposal hash binding
         - voter identity consistency
         - quorum result
     """
@@ -191,67 +196,52 @@ class ConsensusTransportBridge:
         sender_id = self._sender(envelope)
         payload = self._payload(envelope)
 
-        change_id = self._require_str(payload, "change_id")
-        parameter = self._require_str(payload, "parameter")
+        # Verify canonical shape and hash FIRST — before touching ballot_box.
+        # A forged or non-canonical proposal must never register a ballot.
+        try:
+            expected_hash = build_proposal_hash(payload)
+        except CanonicalConsensusViolation as exc:
+            raise ConsensusBridgeViolation(
+                f"Proposal payload is not a canonical mutation: {exc}"
+            ) from exc
+
         proposal_hash = self._require_str(payload, "proposal_hash")
-        value = payload.get("value")
-
-        # Verify hash FIRST — before checking ballot_box.
-        # A forged proposal must never bind to an existing change_id.
-        expected_hash = self.gate._hash_proposal(
-            change_id=change_id,
-            parameter=parameter,
-            value=value,
-            proposer=sender_id,
-        )
-
         if expected_hash != proposal_hash:
             raise ConsensusBridgeViolation(
-                f"Proposal hash mismatch for {change_id}: "
-                f"expected={expected_hash} got={proposal_hash}"
+                f"Proposal hash mismatch: expected={expected_hash} "
+                f"got={proposal_hash}"
             )
 
-        if change_id in self.gate.ballot_box:
-            existing = self.gate.ballot_box[change_id]
-
-            if existing.proposal_hash != proposal_hash:
-                raise ConsensusBridgeViolation(
-                    f"Conflicting proposal hash for {change_id}"
-                )
-
+        if proposal_hash in self.gate.ballot_box:
+            # The key is the canonical hash of the payload itself, so a
+            # duplicate key is by construction the same mutation.
             return None
 
-        proposal = Proposal(
-            change_id=change_id,
-            parameter=parameter,
-            value=value,
-            proposer=sender_id,
-            proposal_hash=proposal_hash,
-            votes={sender_id: True},
-        )
-
-        self.gate.ballot_box[change_id] = proposal
+        try:
+            self.gate.propose_mutation(payload, proposer=sender_id)
+        except ConsensusViolation as exc:
+            raise ConsensusBridgeViolation(str(exc)) from exc
 
         if hasattr(self.store, "record_proposal"):
-            self.store.record_proposal({
-                "change_id": change_id,
-                "parameter": parameter,
-                "value": value,
-                "proposal_hash": proposal_hash,
-                "proposer": sender_id,
-            })
+            self.store.record_proposal(
+                {
+                    **proposal_material(payload),
+                    "proposal_hash": proposal_hash,
+                    "proposer": sender_id,
+                }
+            )
 
         print(
             f"[CONSENSUS_BRIDGE] registered proposal "
-            f"change_id={change_id} proposer={sender_id} hash={proposal_hash}"
+            f"proposal_hash={proposal_hash} proposer={sender_id}"
         )
 
         # Replay any votes that arrived before this proposal
-        for pending in self.pending_votes.pop(change_id, []):
+        for pending in self.pending_votes.pop(proposal_hash, []):
             self._handle_vote(pending)
 
-        if self.gate.check_consensus(change_id):
-            return self._emit_approval(change_id)
+        if self.gate.check_consensus(proposal_hash):
+            return self._emit_approval(proposal_hash)
 
         return None
 
@@ -263,9 +253,8 @@ class ConsensusTransportBridge:
         sender_id = self._sender(envelope)
         payload = self._payload(envelope)
 
-        change_id = self._require_str(payload, "change_id")
-        voter_id = self._require_str(payload, "voter_id")
         proposal_hash = self._require_str(payload, "proposal_hash")
+        voter_id = self._require_str(payload, "voter_id")
 
         if voter_id != sender_id:
             raise ConsensusBridgeViolation(
@@ -278,33 +267,39 @@ class ConsensusTransportBridge:
         vote = payload["vote"]
 
         # Queue vote if proposal hasn't arrived yet
-        if change_id not in self.gate.ballot_box:
-            self.pending_votes.setdefault(change_id, []).append(envelope)
-            print(f"[CONSENSUS_BRIDGE] queued pending vote change_id={change_id} voter={voter_id}")
+        if proposal_hash not in self.gate.ballot_box:
+            self.pending_votes.setdefault(proposal_hash, []).append(envelope)
+            print(
+                f"[CONSENSUS_BRIDGE] queued pending vote "
+                f"proposal_hash={proposal_hash} voter={voter_id}"
+            )
             return None
 
-        reached = self.gate.cast_vote(
-            change_id=change_id,
-            voter_id=voter_id,
-            vote=vote,
-            proposal_hash=proposal_hash,
-        )
+        try:
+            reached = self.gate.cast_vote(
+                proposal_hash=proposal_hash,
+                voter_id=voter_id,
+                vote=vote,
+            )
+        except ConsensusViolation as exc:
+            raise ConsensusBridgeViolation(str(exc)) from exc
 
         if hasattr(self.store, "record_vote"):
-            self.store.record_vote({
-                "change_id": change_id,
-                "voter_id": voter_id,
-                "vote": payload["vote"],
-                "proposal_hash": proposal_hash,
-            })
+            self.store.record_vote(
+                {
+                    "proposal_hash": proposal_hash,
+                    "voter_id": voter_id,
+                    "vote": vote,
+                }
+            )
 
         print(
             f"[CONSENSUS_BRIDGE] recorded vote "
-            f"change_id={change_id} voter={voter_id} vote={vote}"
+            f"proposal_hash={proposal_hash} voter={voter_id} vote={vote}"
         )
 
         if reached:
-            return self._emit_approval(change_id)
+            return self._emit_approval(proposal_hash)
 
         return None
 
@@ -312,27 +307,35 @@ class ConsensusTransportBridge:
     # Approval artifact
     # ------------------------------------------------------------
 
-    def _emit_approval(self, change_id: str) -> Dict[str, Any]:
-        # Read from disk if already approved — never regenerate approved_at.
-        if self.store.has_approval(change_id):
-            print(f"[CONSENSUS_BRIDGE] approval already exists change_id={change_id}")
-            return self.store.read_approval(change_id)
+    def _emit_approval(self, proposal_hash: str) -> Dict[str, Any]:
+        # Read from the store if already approved — never regenerate
+        # approved_at (it is covered by the approval hash).
+        if self.store.has_approval(proposal_hash):
+            print(
+                f"[CONSENSUS_BRIDGE] approval already exists "
+                f"proposal_hash={proposal_hash}"
+            )
+            return self.store.read_approval(proposal_hash)
 
-        proposal = self.gate.require_consensus(change_id)
+        proposal = self.gate.require_consensus(proposal_hash)
         event = self._approval_event_from_proposal(proposal)
 
         self.store.write_approval(event)
 
         print(
-            f"[CONSENSUS_BRIDGE] APPROVED change_id={change_id} "
-            f"proposal_hash={proposal.proposal_hash}"
+            f"[CONSENSUS_BRIDGE] APPROVED proposal_hash={proposal_hash} "
+            f"approval_hash={event['approval_hash']}"
         )
 
         return event
 
-    def _approval_event_from_proposal(self, p: Proposal) -> Dict[str, Any]:
-        yes_votes = sorted(node for node, vote in p.votes.items() if vote is True)
-        no_votes = sorted(node for node, vote in p.votes.items() if vote is False)
+    def _approval_event_from_proposal(self, proposal: Any) -> Dict[str, Any]:
+        yes_votes = sorted(
+            node for node, vote in proposal.votes.items() if vote is True
+        )
+        no_votes = sorted(
+            node for node, vote in proposal.votes.items() if vote is False
+        )
 
         quorum = {
             "threshold": self.gate.quorum_threshold(),
@@ -343,23 +346,18 @@ class ConsensusTransportBridge:
             "no_count": len(no_votes),
         }
 
-        # Hash covers only deterministic proof material.
-        # approved_at is observability metadata, not part of the proof.
-        proof_material = {
-            "event_type": APPROVAL_EVENT_TYPE,
-            "change_id": p.change_id,
-            "parameter": p.parameter,
-            "value": p.value,
-            "proposal_hash": p.proposal_hash,
-            "proposer": p.proposer,
-            "quorum": quorum,
-        }
-
+        # The canonical approval carries the full mutation material so
+        # AlgebraGate can verify every field against the recomputed push
+        # payload. approval_hash covers everything, approved_at included.
         event = {
-            **proof_material,
+            "event_type": APPROVAL_EVENT_TYPE,
+            **proposal_material(proposal.mutation),
+            "proposal_hash": proposal.proposal_hash,
+            "proposer": proposal.proposer,
+            "quorum": quorum,
             "approved_at": utc_ts(),
-            "approval_hash": stable_hash(proof_material),
         }
+        event["approval_hash"] = build_approval_hash(event)
 
         return event
 

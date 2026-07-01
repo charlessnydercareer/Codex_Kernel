@@ -21,12 +21,21 @@ The authority chain has two phases: an offline consensus accumulation phase (bef
 **Offline — consensus accumulation:**
 
 ```
-GossipTransport
-    -> ConsensusTransportBridge (REDUCER: converts verified envelopes into durable approval artifacts)
-        -> ConsensusGate (vote tallying, 2/3+1 quorum math)
-            -> PostgresConsensusStore / ApprovedProposalStore
-                -> Postgres consensus_proposals / consensus_approvals tables
+proposal_producer.py (derives canonical mutation from exact Git objects of the candidate commit)
+    -> GossipTransport (CONSENSUS_PROPOSAL carries the finalized canonical mutation)
+        -> ConsensusTransportBridge (REDUCER: converts verified envelopes into durable approval artifacts)
+            -> ConsensusGate (vote tallying by proposal_hash, 2/3+1 quorum math)
+                -> PostgresConsensusStore / ApprovedProposalStore
+                    -> Postgres consensus_proposals / consensus_approvals tables
 ```
+
+The offline producer and the online gate share one derivation path
+(`PreReceiveGate.derive_protected_mutations`), so the approval written
+offline binds to the byte-identical canonical payload the gate recomputes
+during the push: `refname`, `oldrev`, `newrev`, `changed_paths`,
+`protected_path`, `mutation_type`, `parameter`, `old_value`, `new_value`,
+`diff_hash`, `proposal_version`. There is no translation layer from any
+looser proposal shape.
 
 **Online — push enforcement:**
 
@@ -75,21 +84,25 @@ The consensus-enforcement boundary. It does **not** read `src/state.json`, does 
 
 Any of the above checks failing raises `AlgebraGateViolation`, which propagates to an exit code 1 at the hook boundary.
 
-`algebra_gate.py` has a known bug: `json` is used in `main()` but is not imported. This does not affect the pre-receive integration path (which calls module functions directly), but it makes the CLI entry point non-functional.
+The shared hashing and payload-validation primitives live in `src/canonical_consensus.py` (`canonical_json`, `stable_hash`, `proposal_material`, `build_proposal_hash`, `build_approval_hash`), used identically by the offline producer pipeline and the online gate.
 
 ### `src/consensus_approval_reader.py`
 
 The read-only boundary between `algebra_gate` and Postgres. It queries a JOIN of `consensus_approvals` and `consensus_proposals` on `proposal_hash`. It enforces that exactly one approval row exists (rejecting if zero or more than one are found), validates `event_type == CONSENSUS_APPROVAL`, and verifies the `approval_hash` format via SHA256 hex-digest regex. All database exceptions are wrapped as `ConsensusApprovalViolation`. No writes occur in this module.
 
+### `src/proposal_producer.py`
+
+The offline entry point of the consensus flow. Given `--git-dir`, `--refname`, `--oldrev`, and `--newrev` for a candidate ref update, it derives the finalized canonical mutations (including `proposal_hash`) from the exact Git objects, using the same `PreReceiveGate.derive_protected_mutations` path the online gate runs during the push. It emits one JSON object per line, never writes to the ledger, and never mutates repository state. Rebasing or amending the candidate commit changes `newrev` and therefore invalidates any approvals collected for the previous derivation — this is intentional.
+
 ### `src/consensus_transport_bridge.py`
 
 The reducer that converts verified gossip envelopes into durable Postgres approval records. It is not a transport layer. Its responsibilities:
 
-1. Receive `CONSENSUS_PROPOSAL` and `CONSENSUS_VOTE` envelopes that have already been HMAC-verified by `gossip_protocol.py`.
-2. Manage an in-memory `ballot_box` per `change_id`.
+1. Receive `CONSENSUS_PROPOSAL` and `CONSENSUS_VOTE` envelopes that have already been HMAC-verified by `gossip_protocol.py`. A proposal payload must be a finalized canonical mutation; the bridge recomputes its `proposal_hash` via `canonical_consensus.build_proposal_hash` (which validates all canonical fields) and rejects any mismatch before a ballot is registered.
+2. Manage an in-memory `ballot_box` keyed by `proposal_hash`.
 3. Compute quorum threshold: `(2 * total_nodes) // 3 + 1`.
-4. When threshold is reached, build an approval artifact containing `change_id`, `parameter`, `value`, `proposer`, `proposal_hash`, a quorum block (`authorized_nodes`, `yes_votes`, `no_votes`, counts, threshold), `approved_at`, and `approval_hash`.
-5. Write the approval to `PostgresConsensusStore` (when `CODEX_CONSENSUS_STORE=postgres`) or to the file-backed `ApprovedProposalStore` (`var/consensus/approved/{change_id}.json`).
+4. When threshold is reached, build an approval artifact containing the full canonical mutation material, `proposal_hash`, `proposer`, a quorum block (`authorized_nodes`, `yes_votes`, `no_votes`, counts, threshold), `approved_at`, and `approval_hash` (computed over the entire payload, `approved_at` included).
+5. Write the approval to `PostgresConsensusStore` (when `CODEX_CONSENSUS_STORE=postgres`) or to the file-backed `ApprovedProposalStore` (`var/consensus/approved/{proposal_hash}.json`).
 
 In-memory ballot state is ephemeral. Restarting the bridge process loses unfinalized votes. Durable state lives only in what has been written to the store.
 
@@ -105,7 +118,7 @@ The authenticated inter-node TCP transport. It is responsible for message distri
 
 ### `src/consensus_gate.py`
 
-Vote tallying and in-memory governance. `ConsensusGate` maintains a `ballot_box` dict keyed by `change_id`, accepts proposals with self-votes, records votes from authorized peers, and computes quorum as `(2 * total_nodes) // 3 + 1`. It validates proposal hashes with SHA256 over canonical JSON.
+Vote tallying and in-memory governance. `ConsensusGate` maintains a `ballot_box` dict keyed by canonical `proposal_hash`, accepts canonical-mutation proposals with self-votes, records votes from authorized peers, and computes quorum as `(2 * total_nodes) // 3 + 1`. Proposal validation is delegated to `canonical_consensus.build_proposal_hash`.
 
 `consensus_gate.py` is **not** invoked during a git push. It operates as part of the offline gossip accumulation pipeline via `ConsensusTransportBridge`. The pre-receive enforcement path reads pre-computed approval records from Postgres; it does not collect live votes.
 
@@ -113,10 +126,12 @@ Vote tallying and in-memory governance. `ConsensusGate` maintains a `ballot_box`
 
 The Postgres-backed persistence layer for consensus artifacts. Used by `ConsensusTransportBridge` when `CODEX_CONSENSUS_STORE=postgres`. It provides:
 
-- `record_proposal`: insert into `consensus_proposals` with `ON CONFLICT DO NOTHING`.
-- `record_vote`: insert into `consensus_votes` with `ON CONFLICT DO UPDATE`.
-- `has_approval` / `read_approval`: query `consensus_approvals` by `change_id`, raise `FileNotFoundError` if absent.
-- `write_approval`: insert approval event with `ON CONFLICT DO NOTHING`.
+- `record_proposal`: insert into `consensus_proposals` with `ON CONFLICT (proposal_hash) DO NOTHING`.
+- `record_vote`: insert into `consensus_votes` with `ON CONFLICT (proposal_hash, voter_id) DO UPDATE`.
+- `has_approval` / `read_approval`: query `consensus_approvals` by `proposal_hash`, raise `FileNotFoundError` if absent.
+- `write_approval`: insert approval event with `ON CONFLICT (proposal_hash) DO NOTHING`.
+
+All three tables are keyed by canonical `proposal_hash` and their payloads are validated by pg_jsonschema CHECK constraints against the canonical mutation/approval shapes. Databases provisioned before the canonical schema carry the legacy `change_id`-keyed rows in `*_v1_archive` tables — archived, never dropped.
 
 No hashing or quorum verification logic lives here; those are delegated to `algebra_gate.py` and `canonical_consensus.py`. This module verifies the database contract via `memory.py` at initialization.
 
@@ -189,19 +204,19 @@ To bring up the database stack, use `scripts/compose-up.sh`, which sources crede
 
 ## 6. Consensus Flow
 
-The consensus flow is entirely asynchronous and must complete before a push is attempted.
+The consensus flow is entirely asynchronous and must complete before a push is attempted. The intended operator flow is: **prepare commit → derive canonical mutation from the exact Git objects → collect quorum approvals → push → pre-receive recomputes and matches.**
 
-1. An operator or authorized node proposes a mutation via the `gossip_protocol` CLI (`propose` command with `change_id`, `parameter`, `value`, `proposal_hash`). The envelope is HMAC-SHA256 signed with `CODEX_GOSSIP_SECRET`.
+1. The operator prepares the candidate commit locally and derives the canonical mutation from the exact Git objects with `proposal_producer.py` (`--git-dir`, `--refname`, `--oldrev` = current hub tip, `--newrev` = candidate commit). The output is the finalized mutation payload, including its `proposal_hash`.
 
-2. `GossipTransport` distributes the envelope to peer nodes via TCP with TTL-based flood forwarding. Each hop re-signs with the local node's key.
+2. The proposing node broadcasts the mutation via the `gossip_protocol` CLI (`propose --mutation-json <file|->`). The envelope is HMAC-SHA256 signed with `CODEX_GOSSIP_SECRET`.
 
-3. Each receiving node's `GossipTransport` verifies the envelope signature, deduplicates via `GossipLedger`, and dispatches to `ConsensusTransportBridge.handle_envelope` (if `CODEX_CONSENSUS_BRIDGE=true`).
+3. `GossipTransport` distributes the envelope to peer nodes via TCP with TTL-based flood forwarding. Each hop re-signs with the local node's key. Each receiving node verifies the envelope signature, deduplicates via `GossipLedger`, and dispatches to `ConsensusTransportBridge.handle_envelope` (if `CODEX_CONSENSUS_BRIDGE=true`).
 
-4. Peer nodes cast votes via the gossip CLI (`vote` command). `ConsensusTransportBridge` accumulates votes in an in-memory `ballot_box`, checking voter authorization and proposal hash binding.
+4. Peer nodes cast votes by `proposal_hash` via the gossip CLI (`vote` command). `ConsensusTransportBridge` accumulates votes in an in-memory `ballot_box`, checking voter authorization and canonical hash binding.
 
-5. When `yes_count >= (2 * len(authorized_nodes)) // 3 + 1`, `ConsensusTransportBridge` builds an approval artifact and writes it to `PostgresConsensusStore` (or the file-backed store).
+5. When `yes_count >= (2 * len(authorized_nodes)) // 3 + 1`, `ConsensusTransportBridge` builds the canonical approval artifact and writes it to `PostgresConsensusStore` (or the file-backed store).
 
-6. Only after the approval record exists in Postgres can a push that mutates the corresponding protected field be accepted.
+6. Only after the approval record exists in Postgres can the push of that exact commit be accepted. Amending or rebasing the candidate changes `newrev`, so in-flight votes and stored approvals no longer apply — a new derivation and a new quorum are required.
 
 The 2/3+1 quorum threshold is an integer floor computation: `threshold = (2 * N) // 3 + 1`. For example, with 3 nodes the threshold is 3; with 5 nodes the threshold is 4.
 
@@ -277,14 +292,17 @@ Start the gossip transport on a node:
 python3 src/gossip_protocol.py serve --host 127.0.0.1 --port 9101
 ```
 
-Propose and vote on a mutation via the gossip CLI:
+Derive the canonical mutation for a candidate commit, then propose and vote via the gossip CLI:
 
 ```bash
-# On the proposing node
-python3 src/gossip_protocol.py propose --change-id <id> --parameter cascade_depth --value 1
+# On the proposing node: derive from the exact Git objects
+python3 src/proposal_producer.py --git-dir .git --refname refs/heads/main \
+    --oldrev <current-hub-tip> --newrev <candidate-commit> > mutation.json
+
+python3 src/gossip_protocol.py propose --mutation-json mutation.json
 
 # On each peer node
-python3 src/gossip_protocol.py vote --change-id <id> --vote yes
+python3 src/gossip_protocol.py vote --proposal-hash <sha256:...> --voter-id <node-id> --yes
 ```
 
 Invoke the reconciler manually (standalone; not wired into the push pipeline):

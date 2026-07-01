@@ -1,23 +1,39 @@
-import json
-import hashlib
+import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Any
+from pathlib import Path
+from typing import Any, Dict, List
+
+try:
+    from canonical_consensus import (
+        CanonicalConsensusViolation,
+        build_proposal_hash,
+    )
+except ImportError:
+    sys.path.append(str(Path(__file__).resolve().parent))
+    from canonical_consensus import (
+        CanonicalConsensusViolation,
+        build_proposal_hash,
+    )
+
 
 class ConsensusViolation(RuntimeError):
     pass
 
+
 @dataclass
 class Proposal:
-    change_id: str
-    parameter: str
-    value: Any
-    proposer: str
+    mutation: Dict[str, Any]
     proposal_hash: str
+    proposer: str
     votes: Dict[str, bool] = field(default_factory=dict)
+
 
 class ConsensusGate:
     """
-    Deterministic 2/3 + 1 governance gate.
+    Deterministic 2/3 + 1 governance gate over canonical Git-derived
+    mutations. Proposals are keyed by their canonical proposal_hash, which
+    binds every ballot to the exact incoming Git object identity
+    (refname/oldrev/newrev/diff_hash and the protected-field change).
     """
 
     def __init__(self, node_id: str, peer_list: List[str]):
@@ -31,55 +47,63 @@ class ConsensusGate:
         # Integer-stable quorum math for 2/3 + 1
         return (2 * total_nodes) // 3 + 1
 
-    def _hash_proposal(self, change_id: str, parameter: str, value: Any, proposer: str) -> str:
-        payload = {
-            "change_id": change_id,
-            "parameter": parameter,
-            "value": value,
-            "proposer": proposer,
-        }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+    def propose_mutation(
+        self,
+        mutation: Dict[str, Any],
+        proposer: str | None = None,
+    ) -> str:
+        proposer = proposer or self.node_id
+        if proposer not in self.authorized_nodes:
+            raise ConsensusViolation(f"Unauthorized proposer: {proposer}")
 
-    def propose_change(self, change_id: str, parameter: str, new_value: Any) -> str:
-        if change_id in self.ballot_box:
-            raise ConsensusViolation(f"Proposal already exists: {change_id}")
+        try:
+            expected_hash = build_proposal_hash(mutation)
+        except CanonicalConsensusViolation as exc:
+            raise ConsensusViolation(
+                f"Proposal is not a canonical mutation: {exc}"
+            ) from exc
 
-        proposal_hash = self._hash_proposal(change_id, parameter, new_value, self.node_id)
-        proposal = Proposal(
-            change_id=change_id,
-            parameter=parameter,
-            value=new_value,
-            proposer=self.node_id,
-            proposal_hash=proposal_hash,
-            votes={self.node_id: True},
+        if mutation.get("proposal_hash") != expected_hash:
+            raise ConsensusViolation("Mutation proposal_hash is not canonical.")
+        if expected_hash in self.ballot_box:
+            raise ConsensusViolation(f"Proposal already exists: {expected_hash}")
+
+        self.ballot_box[expected_hash] = Proposal(
+            mutation=dict(mutation),
+            proposal_hash=expected_hash,
+            proposer=proposer,
+            votes={proposer: True},
         )
-        self.ballot_box[change_id] = proposal
-        print(f"[CONSENSUS_GATE] Proposed {parameter}={new_value} change_id={change_id}")
-        return proposal_hash
+        print(
+            f"[CONSENSUS_GATE] Proposed {mutation['parameter']}="
+            f"{mutation['new_value']} proposal_hash={expected_hash}"
+        )
+        return expected_hash
 
-    def cast_vote(self, change_id: str, voter_id: str, vote: bool, proposal_hash: str) -> bool:
+    def cast_vote(
+        self,
+        proposal_hash: str,
+        voter_id: str,
+        vote: bool,
+    ) -> bool:
         if voter_id not in self.authorized_nodes:
             raise ConsensusViolation(f"Unauthorized voter: {voter_id}")
-        if change_id not in self.ballot_box:
-            raise ConsensusViolation(f"Unknown proposal: {change_id}")
-        
-        proposal = self.ballot_box[change_id]
-        if proposal.proposal_hash != proposal_hash:
-            raise ConsensusViolation("Proposal hash mismatch.")
+        if proposal_hash not in self.ballot_box:
+            raise ConsensusViolation(f"Unknown proposal: {proposal_hash}")
 
+        proposal = self.ballot_box[proposal_hash]
         proposal.votes[voter_id] = bool(vote)
-        return self.check_consensus(change_id)
+        return self.check_consensus(proposal_hash)
 
-    def check_consensus(self, change_id: str) -> bool:
-        proposal = self.ballot_box[change_id]
+    def check_consensus(self, proposal_hash: str) -> bool:
+        proposal = self.ballot_box[proposal_hash]
         yes_votes = sum(1 for v in proposal.votes.values() if v is True)
         return yes_votes >= self.quorum_threshold()
 
-    def require_consensus(self, change_id: str) -> Proposal:
+    def require_consensus(self, proposal_hash: str) -> Proposal:
         """Returns the Proposal if quorum is reached, raises if not."""
-        if change_id not in self.ballot_box:
-            raise ConsensusViolation(f"Unknown proposal: {change_id}")
-        if not self.check_consensus(change_id):
-            raise ConsensusViolation(f"Quorum not reached for: {change_id}")
-        return self.ballot_box[change_id]
+        if proposal_hash not in self.ballot_box:
+            raise ConsensusViolation(f"Unknown proposal: {proposal_hash}")
+        if not self.check_consensus(proposal_hash):
+            raise ConsensusViolation(f"Quorum not reached for: {proposal_hash}")
+        return self.ballot_box[proposal_hash]

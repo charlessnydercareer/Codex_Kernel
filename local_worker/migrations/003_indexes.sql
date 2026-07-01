@@ -1,11 +1,6 @@
-CREATE INDEX IF NOT EXISTS idx_consensus_proposals_change_id ON consensus_proposals(change_id);
-CREATE INDEX IF NOT EXISTS idx_consensus_proposals_payload ON consensus_proposals USING GIN(payload);
-
-CREATE INDEX IF NOT EXISTS idx_consensus_votes_change_id ON consensus_votes(change_id);
-CREATE INDEX IF NOT EXISTS idx_consensus_votes_payload ON consensus_votes USING GIN(payload);
-
-CREATE INDEX IF NOT EXISTS idx_consensus_approvals_change_id ON consensus_approvals(change_id);
-CREATE INDEX IF NOT EXISTS idx_consensus_approvals_payload ON consensus_approvals USING GIN(payload);
+CREATE INDEX IF NOT EXISTS idx_consensus_proposals_payload_gin ON consensus_proposals USING GIN(payload);
+CREATE INDEX IF NOT EXISTS idx_consensus_votes_payload_gin ON consensus_votes USING GIN(payload);
+CREATE INDEX IF NOT EXISTS idx_consensus_approvals_payload_gin ON consensus_approvals USING GIN(payload);
 
 CREATE INDEX IF NOT EXISTS idx_kernel_events_type ON kernel_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_kernel_events_payload ON kernel_events USING GIN(payload);
