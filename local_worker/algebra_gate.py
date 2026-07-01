@@ -8,7 +8,6 @@ accepts it only when Postgres contains an approval for that exact mutation.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -22,96 +21,25 @@ from consensus_approval_reader import (
     ConsensusApprovalReader,
     ConsensusApprovalViolation,
 )
+from canonical_consensus import (
+    APPROVAL_EVENT_TYPE,
+    PROPOSAL_VERSION,
+    CanonicalConsensusViolation,
+    approval_material,
+    build_approval_hash,
+    build_proposal_hash,
+    canonical_json,
+    finalize_mutation,
+    proposal_material,
+    stable_hash,
+)
 
 
 class AlgebraGateViolation(RuntimeError):
     pass
 
 
-PROPOSAL_VERSION = 1
 HASH_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
-MUTATION_FIELDS = (
-    "proposal_version",
-    "refname",
-    "oldrev",
-    "newrev",
-    "changed_paths",
-    "protected_path",
-    "mutation_type",
-    "parameter",
-    "old_value",
-    "new_value",
-    "diff_hash",
-)
-
-
-def canonical_json(payload: Dict[str, Any]) -> bytes:
-    return json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
-
-
-def stable_hash(payload: Dict[str, Any]) -> str:
-    return "sha256:" + hashlib.sha256(canonical_json(payload)).hexdigest()
-
-
-def proposal_material(mutation: Dict[str, Any]) -> Dict[str, Any]:
-    missing = [field for field in MUTATION_FIELDS if field not in mutation]
-    if missing:
-        raise AlgebraGateViolation(
-            f"Mutation payload missing fields: {', '.join(missing)}"
-        )
-
-    material = {field: mutation[field] for field in MUTATION_FIELDS}
-
-    if (
-        not isinstance(material["proposal_version"], int)
-        or isinstance(material["proposal_version"], bool)
-        or material["proposal_version"] != PROPOSAL_VERSION
-    ):
-        raise AlgebraGateViolation(
-            f"Unsupported proposal_version: {material['proposal_version']}"
-        )
-    if material["mutation_type"] not in {"add", "update", "delete"}:
-        raise AlgebraGateViolation("Mutation type is invalid.")
-    if not isinstance(material["changed_paths"], list):
-        raise AlgebraGateViolation("changed_paths must be a list.")
-    if material["changed_paths"] != sorted(set(material["changed_paths"])):
-        raise AlgebraGateViolation("changed_paths must be sorted and unique.")
-    if not HASH_PATTERN.fullmatch(str(material["diff_hash"])):
-        raise AlgebraGateViolation("diff_hash is missing or malformed.")
-
-    for field in ("refname", "oldrev", "newrev", "protected_path", "parameter"):
-        if not isinstance(material[field], str) or not material[field]:
-            raise AlgebraGateViolation(f"Mutation field is invalid: {field}")
-
-    return material
-
-
-def build_proposal_hash(mutation: Dict[str, Any]) -> str:
-    return stable_hash(proposal_material(mutation))
-
-
-def finalize_mutation(mutation: Dict[str, Any]) -> Dict[str, Any]:
-    finalized = dict(mutation)
-    finalized["proposal_hash"] = build_proposal_hash(finalized)
-    return finalized
-
-
-def approval_material(approval: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        key: value
-        for key, value in approval.items()
-        if key != "approval_hash"
-    }
-
-
-def build_approval_hash(approval: Dict[str, Any]) -> str:
-    return stable_hash(approval_material(approval))
-
 
 def _validated_node_list(value: Any, field: str) -> list[str]:
     if not isinstance(value, list) or not all(
@@ -198,7 +126,7 @@ def verify_approval_payload(
 ) -> None:
     if not isinstance(approval, dict):
         raise AlgebraGateViolation("Approval payload must be an object.")
-    if approval.get("event_type") != "CONSENSUS_APPROVAL":
+    if approval.get("event_type") != APPROVAL_EVENT_TYPE:
         raise AlgebraGateViolation("Approval payload has invalid event_type.")
     if not isinstance(approval.get("approved_at"), str) or not approval["approved_at"]:
         raise AlgebraGateViolation("Approval approved_at is missing or invalid.")
@@ -295,7 +223,13 @@ def main(argv: list[str]) -> int:
             raise AlgebraGateViolation("Mutation JSON must be an object.")
         run_gate(mutation)
         return 0
-    except (AlgebraGateViolation, ConsensusApprovalViolation, OSError, ValueError) as exc:
+    except (
+        AlgebraGateViolation,
+        CanonicalConsensusViolation,
+        ConsensusApprovalViolation,
+        OSError,
+        ValueError,
+    ) as exc:
         print(f"[ALGEBRA_GATE] REJECTED: {exc}", file=sys.stderr)
         return 1
 
