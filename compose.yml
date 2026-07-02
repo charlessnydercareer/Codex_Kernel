@@ -1,3 +1,9 @@
+# Project name pinned: the folder was renamed codex_nexus -> Codex_Kernel
+# (2026-07-01), and compose derives project/volume names from the directory.
+# Without this pin a fresh `up` would create a new empty ledger volume
+# instead of reusing codex_nexus_codex_postgres_data.
+name: codex_nexus
+
 services:
   codex-postgres:
     image: codex-postgres:18-pgjsonschema
